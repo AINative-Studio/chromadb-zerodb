@@ -147,6 +147,27 @@ class TestCollection:
         # Should have called embeddings + upsert
         assert call_count == 2
 
+    def test_add_calls_project_scoped_url(self, collection):
+        """core#10222: upsert must hit the project-scoped
+        /v1/projects/{project_id}/database/vectors/upsert path, not the
+        old unscoped /api/v1/zerodb/vectors/upsert path."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"ok": True}
+        mock_resp.raise_for_status = MagicMock()
+
+        with patch.object(collection._session, "request", return_value=mock_resp) as mock_req:
+            collection.add(embeddings=[[0.1, 0.2]], ids=["id1"], documents=["hello"])
+
+        called_url = mock_req.call_args.args[1]
+        assert called_url.endswith(f"/v1/projects/{FAKE_PROJECT}/database/vectors/upsert")
+
+        called_body = mock_req.call_args.kwargs["json"]
+        assert called_body["vector_id"] == "test_docs::id1"
+        assert called_body["vector_embedding"] == [0.1, 0.2]
+        assert called_body["document"] == "hello"
+        assert called_body["namespace"] == "test_docs"
+
     def test_add_with_embeddings_directly(self, collection):
         mock_resp = MagicMock()
         mock_resp.status_code = 200
@@ -195,13 +216,15 @@ class TestCollection:
         mock_search_resp.json.return_value = {
             "results": [
                 {
-                    "id": "test_docs::id1",
-                    "metadata": {"_document": "hello world", "_collection": "test_docs", "topic": "greetings"},
+                    "vector_id": "test_docs::id1",
+                    "document": "hello world",
+                    "vector_metadata": {"topic": "greetings"},
                     "distance": 0.05,
                 },
                 {
-                    "id": "test_docs::id2",
-                    "metadata": {"_document": "goodbye world", "_collection": "test_docs"},
+                    "vector_id": "test_docs::id2",
+                    "document": "goodbye world",
+                    "vector_metadata": {},
                     "distance": 0.15,
                 },
             ]
@@ -219,9 +242,6 @@ class TestCollection:
         assert results["ids"] == [["id1", "id2"]]
         assert results["documents"] == [["hello world", "goodbye world"]]
         assert results["distances"] == [[0.05, 0.15]]
-        # Internal metadata keys should be stripped
-        assert "_collection" not in results["metadatas"][0][0]
-        assert "_document" not in results["metadatas"][0][0]
         assert results["metadatas"][0][0].get("topic") == "greetings"
 
     def test_query_with_embeddings(self, collection):
@@ -239,8 +259,9 @@ class TestCollection:
         mock_resp = MagicMock()
         mock_resp.status_code = 200
         mock_resp.json.return_value = {
-            "id": "test_docs::id1",
-            "metadata": {"_document": "hello", "_collection": "test_docs", "key": "val"},
+            "vector_id": "test_docs::id1",
+            "document": "hello",
+            "vector_metadata": {"key": "val"},
         }
         mock_resp.raise_for_status = MagicMock()
 
@@ -285,10 +306,26 @@ class TestCollection:
             # Should not raise
             collection.delete(ids=["nonexistent"])
 
+    def test_get_calls_project_scoped_url(self, collection):
+        """core#10222: get-by-id must hit the project-scoped vectors
+        path, with vector_id as a path segment and namespace as a query
+        param."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"vector_id": "test_docs::id1", "document": "hello", "vector_metadata": {}}
+        mock_resp.raise_for_status = MagicMock()
+
+        with patch.object(collection._session, "request", return_value=mock_resp) as mock_req:
+            collection.get(ids=["id1"])
+
+        called_url = mock_req.call_args.args[1]
+        assert called_url.endswith(f"/v1/projects/{FAKE_PROJECT}/database/vectors/test_docs::id1")
+        assert mock_req.call_args.kwargs["params"] == {"namespace": "test_docs"}
+
     def test_count(self, collection):
         mock_resp = MagicMock()
         mock_resp.status_code = 200
-        mock_resp.json.return_value = {"total_vectors": 42}
+        mock_resp.json.return_value = {"total_count": 42}
         mock_resp.raise_for_status = MagicMock()
 
         with patch.object(collection._session, "request", return_value=mock_resp):
@@ -365,8 +402,9 @@ class TestIntegrationFlow:
         mock_search_resp.json.return_value = {
             "results": [
                 {
-                    "id": "knowledge::d1",
-                    "metadata": {"_document": "Python is great", "_collection": "knowledge"},
+                    "vector_id": "knowledge::d1",
+                    "document": "Python is great",
+                    "vector_metadata": {},
                     "distance": 0.02,
                 },
             ]

@@ -35,6 +35,14 @@ class Collection:
         resp.raise_for_status()
         return resp
 
+    def _vectors_path(self, suffix: str = "") -> str:
+        """core#10222: project-scoped vectors path, replacing the old
+        unscoped /api/v1/zerodb/vectors/* path this SDK originally called
+        (which has no project-scoping concept -- it resolves only via the
+        API key's owning user). `suffix` is appended as-is, e.g.
+        "/upsert" or f"/{vector_id}"."""
+        return f"/v1/projects/{self._project_id}/database/vectors{suffix}"
+
     def _prefixed_id(self, doc_id: str) -> str:
         """Prefix an ID with collection name for namespace isolation."""
         return f"{self.name}::{doc_id}"
@@ -102,18 +110,16 @@ class Collection:
 
         for i in range(n_items):
             meta = dict(metadatas[i]) if metadatas[i] else {}
-            meta["_collection"] = self.name
-            if documents[i] is not None:
-                meta["_document"] = documents[i]
 
             self._request(
                 "POST",
-                "/api/v1/zerodb/vectors/upsert",
+                self._vectors_path("/upsert"),
                 json={
-                    "id": self._prefixed_id(ids[i]),
-                    "vector": embeddings[i],
-                    "metadata": meta,
+                    "vector_id": self._prefixed_id(ids[i]),
+                    "vector_embedding": embeddings[i],
+                    "vector_metadata": meta,
                     "document": documents[i] or "",
+                    "namespace": self.name,
                 },
             )
 
@@ -149,22 +155,22 @@ class Collection:
 
         for embedding in query_embeddings:
             search_body: Dict[str, Any] = {
-                "vector": embedding,
+                "query_vector": embedding,
                 "limit": n_results,
+                "namespace": self.name,
             }
-            # Add collection filter
-            filter_dict = dict(where) if where else {}
-            filter_dict["_collection"] = self.name
-            search_body["filter"] = filter_dict
+            if where:
+                search_body["metadata_filter"] = dict(where)
 
             resp = self._request(
                 "POST",
-                "/api/v1/zerodb/vectors/search",
+                self._vectors_path("/search"),
                 json=search_body,
             )
             results = resp.json()
 
-            # Normalize results format
+            # VectorSearchResult wraps matches; normalize defensively in
+            # case the shape varies by server version.
             matches = results if isinstance(results, list) else results.get("results", results.get("matches", []))
 
             ids_batch = []
@@ -173,11 +179,10 @@ class Collection:
             dists_batch = []
 
             for match in matches:
-                raw_id = match.get("id", "")
+                raw_id = match.get("vector_id", match.get("id", ""))
                 ids_batch.append(self._strip_prefix(raw_id))
-                meta = match.get("metadata", {})
-                docs_batch.append(meta.pop("_document", match.get("document", "")))
-                meta.pop("_collection", None)
+                meta = match.get("vector_metadata") or match.get("metadata") or {}
+                docs_batch.append(match.get("document", ""))
                 metas_batch.append(meta)
                 dists_batch.append(match.get("distance", match.get("score", 0.0)))
 
@@ -216,14 +221,13 @@ class Collection:
                 try:
                     resp = self._request(
                         "GET",
-                        f"/api/v1/zerodb/vectors/{self._prefixed_id(doc_id)}",
+                        self._vectors_path(f"/{self._prefixed_id(doc_id)}"),
+                        params={"namespace": self.name},
                     )
                     data = resp.json()
                     result_ids.append(doc_id)
-                    meta = data.get("metadata", {})
-                    result_documents.append(meta.pop("_document", data.get("document", "")))
-                    meta.pop("_collection", None)
-                    result_metadatas.append(meta)
+                    result_documents.append(data.get("document", ""))
+                    result_metadatas.append(data.get("vector_metadata") or {})
                 except requests.HTTPError as e:
                     if e.response is not None and e.response.status_code == 404:
                         continue
@@ -287,7 +291,8 @@ class Collection:
                 try:
                     self._request(
                         "DELETE",
-                        f"/api/v1/zerodb/vectors/{self._prefixed_id(doc_id)}",
+                        self._vectors_path(f"/{self._prefixed_id(doc_id)}"),
+                        params={"namespace": self.name},
                     )
                 except requests.HTTPError as e:
                     if e.response is not None and e.response.status_code == 404:
@@ -298,14 +303,16 @@ class Collection:
         """Return the number of documents in this collection.
 
         Returns:
-            Number of vectors with this collection's namespace prefix.
+            Number of vectors in this collection's namespace.
         """
         try:
-            resp = self._request("GET", "/api/v1/zerodb/vectors/stats")
+            resp = self._request(
+                "GET",
+                self._vectors_path("/stats"),
+                params={"namespace": self.name},
+            )
             data = resp.json()
-            # Stats endpoint returns total count; we approximate by
-            # returning total since per-collection count requires a scan.
-            return data.get("total_vectors", data.get("count", 0))
+            return data.get("total_count", 0)
         except requests.HTTPError:
             return 0
 
@@ -314,16 +321,20 @@ class Collection:
         try:
             resp = self._request(
                 "GET",
-                f"/api/v1/zerodb/vectors?limit=1000",
+                self._vectors_path(),
+                params={"namespace": self.name, "limit": 1000},
             )
             data = resp.json()
-            vectors = data if isinstance(data, list) else data.get("vectors", data.get("results", []))
-            prefix = f"{self.name}::"
+            vectors = data.get("vectors", [])
             for vec in vectors:
-                vec_id = vec.get("id", "")
-                if vec_id.startswith(prefix):
+                vec_id = vec.get("vector_id", "")
+                if vec_id:
                     try:
-                        self._request("DELETE", f"/api/v1/zerodb/vectors/{vec_id}")
+                        self._request(
+                            "DELETE",
+                            self._vectors_path(f"/{vec_id}"),
+                            params={"namespace": self.name},
+                        )
                     except requests.HTTPError:
                         pass
         except requests.HTTPError:
