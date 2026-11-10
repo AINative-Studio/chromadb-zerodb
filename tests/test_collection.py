@@ -40,10 +40,26 @@ class TestClient:
         assert isinstance(col, Collection)
         assert col.name == "my_col"
 
+    def test_create_collection_threads_project_id(self, client):
+        """core#10221: Collection must carry the Client's project_id so a
+        later call site (core#10222) can switch its request paths to the
+        project-scoped /v1/projects/{project_id}/database/vectors/* routes
+        -- the generic /api/v1/zerodb/vectors/* path this SDK currently
+        calls has no project-scoping concept at all (resolves only via the
+        API key's owning user), so project_id must come from the Collection
+        itself, not be inferred backend-side."""
+        col = client.create_collection("my_col")
+        assert col._project_id == FAKE_PROJECT
+
     def test_get_collection(self, client):
         client.create_collection("existing")
         col = client.get_collection("existing")
         assert col.name == "existing"
+
+    def test_get_collection_threads_project_id(self, client):
+        client.create_collection("existing")
+        col = client.get_collection("existing")
+        assert col._project_id == FAKE_PROJECT
 
     def test_get_or_create_collection_new(self, client):
         col = client.get_or_create_collection("new_col")

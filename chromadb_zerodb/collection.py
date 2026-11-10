@@ -21,11 +21,13 @@ class Collection:
         metadata: Optional[Dict[str, Any]],
         session: requests.Session,
         base_url: str,
+        project_id: str,
     ):
         self.name = name
         self.metadata = metadata or {}
         self._session = session
         self._base_url = base_url.rstrip("/")
+        self._project_id = project_id
 
     def _request(self, method: str, path: str, **kwargs) -> requests.Response:
         url = f"{self._base_url}{path}"

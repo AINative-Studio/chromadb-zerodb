@@ -79,6 +79,7 @@ class Client:
             metadata=metadata,
             session=self._session,
             base_url=self._base_url,
+            project_id=self._project_id,
         )
 
     def get_collection(self, name: str) -> Collection:
@@ -95,6 +96,7 @@ class Client:
             metadata=self._collections.get(name, {}).get("metadata"),
             session=self._session,
             base_url=self._base_url,
+            project_id=self._project_id,
         )
 
     def get_or_create_collection(
