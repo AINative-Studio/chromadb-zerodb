@@ -255,6 +255,27 @@ class TestCollection:
 
         assert results["ids"] == [[]]
 
+    def test_query_calls_project_scoped_url(self, collection):
+        """core#10224: search must hit the project-scoped vectors/search
+        path with the real VectorSearchRequest field names (query_vector,
+        namespace, metadata_filter) -- not the old vector/filter shape."""
+        mock_search_resp = MagicMock()
+        mock_search_resp.status_code = 200
+        mock_search_resp.json.return_value = {"results": []}
+        mock_search_resp.raise_for_status = MagicMock()
+
+        with patch.object(collection._session, "request", return_value=mock_search_resp) as mock_req:
+            collection.query(query_embeddings=[[0.1, 0.2]], n_results=5, where={"topic": "x"})
+
+        called_url = mock_req.call_args.args[1]
+        assert called_url.endswith(f"/v1/projects/{FAKE_PROJECT}/database/vectors/search")
+
+        called_body = mock_req.call_args.kwargs["json"]
+        assert called_body["query_vector"] == [0.1, 0.2]
+        assert called_body["limit"] == 5
+        assert called_body["namespace"] == "test_docs"
+        assert called_body["metadata_filter"] == {"topic": "x"}
+
     def test_get_by_ids(self, collection):
         mock_resp = MagicMock()
         mock_resp.status_code = 200
@@ -322,6 +343,21 @@ class TestCollection:
         assert called_url.endswith(f"/v1/projects/{FAKE_PROJECT}/database/vectors/test_docs::id1")
         assert mock_req.call_args.kwargs["params"] == {"namespace": "test_docs"}
 
+    def test_delete_calls_project_scoped_url(self, collection):
+        """core#10224: delete must hit the project-scoped vectors path,
+        with vector_id as a path segment and namespace as a query param --
+        same shape as get."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+
+        with patch.object(collection._session, "request", return_value=mock_resp) as mock_req:
+            collection.delete(ids=["id1"])
+
+        called_url = mock_req.call_args.args[1]
+        assert called_url.endswith(f"/v1/projects/{FAKE_PROJECT}/database/vectors/test_docs::id1")
+        assert mock_req.call_args.kwargs["params"] == {"namespace": "test_docs"}
+
     def test_count(self, collection):
         mock_resp = MagicMock()
         mock_resp.status_code = 200
@@ -331,6 +367,22 @@ class TestCollection:
         with patch.object(collection._session, "request", return_value=mock_resp):
             assert collection.count() == 42
 
+    def test_count_calls_project_scoped_url(self, collection):
+        """core#10224: stats must hit the project-scoped vectors/stats
+        path with namespace as a query param, and read the real
+        VectorStatsResponse field name (total_count, not total_vectors)."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"total_count": 7}
+        mock_resp.raise_for_status = MagicMock()
+
+        with patch.object(collection._session, "request", return_value=mock_resp) as mock_req:
+            collection.count()
+
+        called_url = mock_req.call_args.args[1]
+        assert called_url.endswith(f"/v1/projects/{FAKE_PROJECT}/database/vectors/stats")
+        assert mock_req.call_args.kwargs["params"] == {"namespace": "test_docs"}
+
     def test_count_on_error(self, collection):
         from requests.exceptions import HTTPError
         error_resp = MagicMock()
@@ -339,6 +391,44 @@ class TestCollection:
 
         with patch.object(collection._session, "request", side_effect=exc):
             assert collection.count() == 0
+
+    def test_delete_all_calls_project_scoped_urls(self, collection):
+        """core#10224: _delete_all (used by Client.delete_collection) must
+        list via the project-scoped vectors path with namespace filtering
+        server-side, then delete each returned vector_id via the same
+        project-scoped per-vector path -- not the old client-side
+        ID-prefix filtering."""
+        list_resp = MagicMock()
+        list_resp.status_code = 200
+        list_resp.json.return_value = {
+            "vectors": [{"vector_id": "test_docs::a"}, {"vector_id": "test_docs::b"}]
+        }
+        list_resp.raise_for_status = MagicMock()
+
+        delete_resp = MagicMock()
+        delete_resp.status_code = 200
+        delete_resp.raise_for_status = MagicMock()
+
+        calls = []
+
+        def side_effect(method, url, **kwargs):
+            calls.append((method, url, kwargs.get("params")))
+            if method == "GET":
+                return list_resp
+            return delete_resp
+
+        with patch.object(collection._session, "request", side_effect=side_effect):
+            collection._delete_all()
+
+        list_calls = [c for c in calls if c[0] == "GET"]
+        assert len(list_calls) == 1
+        assert list_calls[0][1].endswith(f"/v1/projects/{FAKE_PROJECT}/database/vectors")
+        assert list_calls[0][2] == {"namespace": "test_docs", "limit": 1000}
+
+        delete_calls = [c for c in calls if c[0] == "DELETE"]
+        assert len(delete_calls) == 2
+        assert delete_calls[0][1].endswith(f"/v1/projects/{FAKE_PROJECT}/database/vectors/test_docs::a")
+        assert delete_calls[1][1].endswith(f"/v1/projects/{FAKE_PROJECT}/database/vectors/test_docs::b")
 
     def test_upsert_delegates_to_add(self, collection):
         with patch.object(collection, "add") as mock_add:
