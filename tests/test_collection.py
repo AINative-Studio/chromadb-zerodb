@@ -531,3 +531,107 @@ class TestIntegrationFlow:
         assert results["ids"] == [["d1"]]
         assert results["documents"] == [["Python is great"]]
         assert len(call_log) >= 4  # embed + 2 upserts + embed + search
+
+
+# ---------------------------------------------------------------------------
+# Old-path non-regression (core#10224, bullet 2 / core#10223's decision)
+# ---------------------------------------------------------------------------
+#
+# core#10223 decided the OLD /api/v1/zerodb/vectors/* path stays
+# permanently supported server-side (no deprecation warnings, no sunset)
+# -- but that is a decision about what the SERVER keeps accepting from
+# OTHER, older callers. It says nothing about THIS SDK, which should
+# never construct a request to that old path again now that #10221/#10222
+# landed. These tests pin that: every live vectors operation goes through
+# the single _vectors_path() chokepoint, and nothing in the module
+# references the old unscoped path as a literal URL.
+
+import inspect
+import re
+
+import chromadb_zerodb.collection as collection_module
+
+
+class TestOldVectorsPathNotCalled:
+    OLD_PATH_LITERAL = "/api/v1/zerodb/vectors"
+
+    def test_vectors_path_is_the_single_url_builder_for_vector_ops(self, collection):
+        """Every public Collection method that talks to the vectors API
+        (add/query/get/delete/count/_delete_all) must route through
+        _vectors_path() -- not construct a vectors URL by any other
+        means. Proven by patching _vectors_path itself and confirming
+        every one of these methods calls through it at least once."""
+        with patch.object(
+            collection, "_vectors_path", wraps=collection._vectors_path
+        ) as spy, patch.object(collection._session, "request") as mock_req:
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.json.return_value = {"vectors": [], "total_count": 0}
+            mock_resp.raise_for_status = MagicMock()
+            mock_req.return_value = mock_resp
+
+            collection.add(embeddings=[[0.1]], ids=["x"], documents=["d"])
+            collection.query(query_embeddings=[[0.1]])
+            collection.get(ids=["x"])
+            collection.delete(ids=["x"])
+            collection.count()
+            collection._delete_all()
+
+        assert spy.call_count >= 6, (
+            "expected every vectors operation (add/query/get/delete/count/"
+            "_delete_all) to route through _vectors_path(); if a new call "
+            "site bypasses it, this count drops and the test catches the "
+            "same class of bug core#10213 originally found"
+        )
+
+    def test_no_live_code_references_the_old_unscoped_vectors_path(self):
+        """The OLD /api/v1/zerodb/vectors/* literal must not appear as an
+        actual string CONSTANT used by live code (an f-string, a literal
+        passed to a function, etc.) -- only inside docstrings/comments
+        explaining the history (core#10213/#10222). Uses the real AST
+        rather than a line-text scan so a docstring mentioning the old
+        path (as collection.py's own module already does, deliberately,
+        to document WHY _vectors_path looks the way it does) is correctly
+        excluded, while a real live reference anywhere -- even reformatted
+        across lines -- would still be caught."""
+        import ast
+
+        source = inspect.getsource(collection_module)
+        tree = ast.parse(source)
+
+        docstring_nodes = set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                doc = ast.get_docstring(node, clean=False)
+                if doc is not None:
+                    # The docstring is the first statement's Constant node.
+                    body = getattr(node, "body", [])
+                    if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+                        docstring_nodes.add(id(body[0].value))
+
+        offending = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and self.OLD_PATH_LITERAL in node.value
+            and id(node) not in docstring_nodes
+        ]
+        assert offending == [], (
+            f"found the deprecated path in a non-docstring string constant "
+            f"at line(s) {[n.lineno for n in offending]} -- this is live "
+            f"code, not doc text"
+        )
+
+    def test_vectors_path_output_never_matches_the_old_unscoped_shape(self, collection):
+        """Defends the actual URL _vectors_path() produces, not just the
+        source text -- a future refactor could remove the docstring
+        comment above but still regress the real returned path. Checks
+        every suffix shape exercised by the real call sites."""
+        for suffix in ("", "/upsert", "/search", "/stats", f"/{collection.name}::id1"):
+            built = collection._vectors_path(suffix)
+            assert not re.match(r"^/api/v1/zerodb/vectors", built), (
+                f"_vectors_path({suffix!r}) returned {built!r}, which matches "
+                "the old deprecated shape"
+            )
+            assert built.startswith(f"/v1/projects/{collection._project_id}/database/vectors")
